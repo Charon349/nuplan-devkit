@@ -487,8 +487,20 @@ class SimulationTile:
         if horizon <= 0:
             return []
 
+        ego_heading = current_ego_state.rear_axle.heading
+        expert_local_headings = np.array([state.rear_axle.heading - ego_heading for state in future_expert_states[:horizon]])
+        
+        gt_cos = np.cos(expert_local_headings)[None, :]
+        gt_sin = np.sin(expert_local_headings)[None, :]
+
         diff = anchor_templates[:, :horizon, :2] - expert_local_xy[None, :horizon, :2]
-        l2_distances = np.linalg.norm(diff, axis=-1).mean(axis=1)
+        
+        lat_err = np.abs(diff[..., 0] * (-gt_sin) + diff[..., 1] * gt_cos)
+        lon_err = np.abs(diff[..., 0] * gt_cos + diff[..., 1] * gt_sin)
+        
+        w_lat = 1.0
+        w_lon = 0.2
+        l2_distances = (w_lat * lat_err + w_lon * lon_err).mean(axis=1)
         top_indices = np.argsort(l2_distances)[:3]
         score_by_index = {
             item.get("index"): item.get("score")
