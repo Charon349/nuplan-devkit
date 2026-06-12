@@ -51,6 +51,20 @@ simulation_tile_style: Dict[str, Any] = {
 simulation_tile_trajectory_style: Dict[str, Any] = {
     "ego": {"line_color": "#00C8C8", "line_alpha": 0.8, "line_width": 2},
     "expert_ego": {"line_color": "#FA9600", "line_alpha": 0.8, "line_width": 2},
+    "future_expert_ego": {"line_color": "#BFFF00", "line_alpha": 0.9, "line_width": 2, "line_dash": "dashed"},
+    "selected_anchor": {"line_color": "#FF4DD2", "line_alpha": 0.95, "line_width": 3, "line_dash": "dashed"},
+    "selected_anchor_topk": {
+        "line_colors": ["#FF4DD2", "#00FF66", "#00BFFF"],
+        "line_alpha": 0.95,
+        "line_widths": [3, 2, 2],
+        "line_dash": "dashed",
+    },
+    "gt_l2_anchor_topk": {
+        "line_colors": ["#FFD400", "#FF8C00", "#FFFFFF"],
+        "line_alpha": 0.95,
+        "line_widths": [3, 2, 2],
+        "line_dash": "dotdash",
+    },
 }
 
 simulation_tile_agent_style: Dict[str, Any] = {

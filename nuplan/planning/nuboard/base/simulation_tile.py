@@ -3,6 +3,7 @@ import json
 import logging
 import lzma
 import math
+import os
 import pathlib
 import pickle
 import threading
@@ -29,7 +30,8 @@ from tornado import gen
 from tqdm import tqdm
 
 from nuplan.common.actor_state.ego_state import EgoState
-from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.common.actor_state.state_representation import Point2D, StateSE2
+from nuplan.common.geometry.convert import relative_to_absolute_poses
 from nuplan.common.actor_state.vehicle_parameters import VehicleParameters
 from nuplan.common.maps.abstract_map import AbstractMap, MapObject
 from nuplan.common.maps.abstract_map_factory import AbstractMapFactory
@@ -37,7 +39,11 @@ from nuplan.common.maps.maps_datatypes import SemanticMapLayer, StopLineType
 from nuplan.planning.nuboard.base.data_class import SimulationScenarioKey
 from nuplan.planning.nuboard.base.experiment_file_data import ExperimentFileData
 from nuplan.planning.nuboard.base.plot_data import MapPoint, SimulationData, SimulationFigure
-from nuplan.planning.nuboard.style import simulation_map_layer_color, simulation_tile_style
+from nuplan.planning.nuboard.style import (
+    simulation_map_layer_color,
+    simulation_tile_style,
+    simulation_tile_trajectory_style,
+)
 from nuplan.planning.nuboard.tabs.config.scenario_tab_config import (
     ScenarioTabFrameButtonConfig,
     first_button_config,
@@ -69,6 +75,86 @@ def extract_source_from_states(states: List[EgoState]) -> ColumnDataSource:
         y_coords.append(state.center.y)
     source = ColumnDataSource(dict(xs=x_coords, ys=y_coords))
     return source
+
+
+def _transform_local_xy_to_global(local_xy: List[List[float]], ego: Dict[str, float]) -> Tuple[List[float], List[float]]:
+    """
+    Transform local ego-frame xy coordinates into global coordinates.
+    :param local_xy: Local [x, y] coordinates.
+    :param ego: Ego pose with x, y, heading.
+    :return: Global x/y lists.
+    """
+    origin = StateSE2(float(ego["x"]), float(ego["y"]), float(ego["heading"]))
+    relative_poses = [StateSE2(float(xy[0]), float(xy[1]), 0.0) for xy in local_xy]
+    absolute_poses = relative_to_absolute_poses(origin, relative_poses)
+    xs = [pose.x for pose in absolute_poses]
+    ys = [pose.y for pose in absolute_poses]
+    return xs, ys
+
+
+def _load_anchor_xy_templates(anchor_path: str, state_format: str) -> Optional[np.ndarray]:
+    """
+    Load all ego anchor templates as local-frame xy trajectories.
+    :param anchor_path: Anchor file path.
+    :param state_format: "delta" or "absolute".
+    :return: Anchor local xy array with shape [K, T, 2].
+    """
+    if not anchor_path:
+        return None
+
+    path = pathlib.Path(anchor_path)
+    if not path.exists():
+        return None
+
+    if path.suffix in (".pt", ".pth"):
+        import torch
+
+        anchor = torch.load(str(path), map_location="cpu")
+    else:
+        anchor = np.load(str(path))
+
+    if isinstance(anchor, dict):
+        for key in ("anchors", "ego_anchors", "plan_anchor"):
+            if key in anchor:
+                anchor = anchor[key]
+                break
+        else:
+            return None
+
+    if hasattr(anchor, "detach"):
+        anchor = anchor.detach().cpu().numpy()
+
+    anchor = np.asarray(anchor, dtype=np.float64)
+    if anchor.ndim != 3 or anchor.shape[-1] < 2:
+        return None
+
+    # Older logs did not record anchor_state_format. A [K, T, 3] anchor file is
+    # absolute [x, y, heading]; delta anchors in this project have [K, T, 4].
+    if state_format == "absolute" or anchor.shape[-1] == 3:
+        return anchor[..., :2]
+
+    return np.cumsum(anchor[..., :2], axis=1)
+
+
+def _global_xy_to_local_xy(global_xy: List[List[float]], ego: Any) -> np.ndarray:
+    """
+    Transform global xy coordinates into ego local frame.
+    :param global_xy: Global xy coordinates.
+    :param ego: Ego rear axle pose.
+    :return: Local xy array.
+    """
+    ego_x = float(ego.x)
+    ego_y = float(ego.y)
+    ego_heading = float(ego.heading)
+    cos_h = math.cos(ego_heading)
+    sin_h = math.sin(ego_heading)
+
+    local_xy = []
+    for x, y in global_xy:
+        dx = float(x) - ego_x
+        dy = float(y) - ego_y
+        local_xy.append([dx * cos_h + dy * sin_h, -dx * sin_h + dy * cos_h])
+    return np.asarray(local_xy, dtype=np.float64)
 
 
 def _extract_serialization_type(first_file: pathlib.Path) -> str:
@@ -294,6 +380,15 @@ class SimulationTile:
             simulation_history=simulation_log.simulation_history,
             x_y_coordinate_title=x_y_coordinate_title,
         )
+        selected_anchor_sources = self._load_selected_anchor_sources(
+            simulation_file=simulation_file,
+            simulation_history=simulation_log.simulation_history,
+            scenario=simulation_log.scenario,
+        )
+        simulation_figure_data.selected_anchor_trajectory_plot.update_data_sources(  # type: ignore
+            frame_sources=selected_anchor_sources,
+            history=simulation_log.simulation_history,
+        )
 
         return simulation_figure_data
 
@@ -307,6 +402,315 @@ class SimulationTile:
             self._maps[map_name] = self._map_factory.build_map_from_name(map_name)
 
         return self._maps[map_name]
+
+    @staticmethod
+    def _find_anchor_log_dirs(simulation_file: pathlib.Path) -> List[pathlib.Path]:
+        """
+        Find anchor selection log directories associated with a simulation log.
+        :param simulation_file: Serialized SimulationLog path.
+        :return: Candidate anchor_selection_logs directories.
+        """
+        candidates = []
+        explicit_anchor_log_dir = os.getenv("NUBOARD_ANCHOR_LOG_DIR", "")
+        if explicit_anchor_log_dir:
+            explicit_candidate = pathlib.Path(explicit_anchor_log_dir)
+            if explicit_candidate.exists() and explicit_candidate.is_dir():
+                candidates.append(explicit_candidate)
+            else:
+                logger.warning("NUBOARD_ANCHOR_LOG_DIR does not exist: %s", explicit_anchor_log_dir)
+
+        for path in [simulation_file.parent] + list(simulation_file.parents):
+            candidate = path / "anchor_selection_logs"
+            if candidate.exists() and candidate.is_dir():
+                candidates.append(candidate)
+
+        # Backward compatibility for logs written before anchor logs were moved under
+        # <NUPLAN_EXP_ROOT>/exp/simulation/<challenge>/<experiment_uid>/anchor_selection_logs.
+        parts = simulation_file.parts
+        for index in range(len(parts) - 2):
+            if parts[index] == "exp" and parts[index + 1] == "simulation":
+                root = pathlib.Path(*parts[:index])
+                for end_index in range(index + 4, len(parts)):
+                    experiment_uid = pathlib.Path(*parts[index + 3 : end_index])
+                    legacy_candidate = root / experiment_uid / "anchor_selection_logs"
+                    if legacy_candidate.exists() and legacy_candidate.is_dir():
+                        candidates.append(legacy_candidate)
+                break
+
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _gt_l2_anchor_entries(
+        record: Dict[str, Any],
+        frame_index: int,
+        history_samples: List[Any],
+        expert_states: List[EgoState],
+        expert_time_to_index: Dict[int, int],
+        anchor_template_cache: Dict[Tuple[str, str], Optional[np.ndarray]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Get top3 anchors with the smallest L2 distance to expert future.
+        :param record: Anchor selection record.
+        :param frame_index: Current simulation frame.
+        :param history_samples: Simulation history samples.
+        :param expert_states: Expert ego states.
+        :param expert_time_to_index: Expert state time to index map.
+        :param anchor_template_cache: Cache of loaded anchor templates.
+        :return: Anchor entries compatible with selected-anchor plotting.
+        """
+        if frame_index >= len(history_samples):
+            return []
+
+        anchor_path = str(record.get("anchor_path") or "")
+        state_format = str(record.get("anchor_state_format") or "delta")
+        cache_key = (anchor_path, state_format)
+        if cache_key not in anchor_template_cache:
+            anchor_template_cache[cache_key] = _load_anchor_xy_templates(anchor_path, state_format)
+
+        anchor_templates = anchor_template_cache[cache_key]
+        if anchor_templates is None or anchor_templates.size == 0:
+            return []
+
+        current_ego_state = history_samples[frame_index].ego_state
+        expert_index = expert_time_to_index.get(current_ego_state.time_us)
+        if expert_index is None:
+            return []
+
+        future_len = anchor_templates.shape[1]
+        future_expert_states = expert_states[expert_index + 1 : expert_index + 1 + future_len]
+        if not future_expert_states:
+            return []
+
+        expert_global_xy = [[state.rear_axle.x, state.rear_axle.y] for state in future_expert_states]
+        expert_local_xy = _global_xy_to_local_xy(expert_global_xy, current_ego_state.rear_axle)
+        horizon = min(anchor_templates.shape[1], expert_local_xy.shape[0])
+        if horizon <= 0:
+            return []
+
+        diff = anchor_templates[:, :horizon, :2] - expert_local_xy[None, :horizon, :2]
+        l2_distances = np.linalg.norm(diff, axis=-1).mean(axis=1)
+        top_indices = np.argsort(l2_distances)[:3]
+        score_by_index = {
+            item.get("index"): item.get("score")
+            for item in record.get("anchor_score_topk", [])
+            if isinstance(item, dict)
+        }
+
+        return [
+            {
+                "rank": rank,
+                "index": int(anchor_index),
+                "score": score_by_index.get(int(anchor_index)),
+                "l2": float(l2_distances[anchor_index]),
+                "xy": anchor_templates[anchor_index].tolist(),
+                "source": "gt_l2_topk",
+            }
+            for rank, anchor_index in enumerate(top_indices, start=1)
+        ]
+
+    @staticmethod
+    def _score_topk_anchor_entries(
+        record: Dict[str, Any],
+        anchor_template_cache: Dict[Tuple[str, str], Optional[np.ndarray]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Get top score anchors from the current record.
+        :param record: Anchor selection record.
+        :param anchor_template_cache: Cache of loaded anchor templates.
+        :return: Top score anchor entries.
+        """
+        anchor_entries = record.get("topk_anchor_template_xy") or []
+        if anchor_entries:
+            return [
+                {
+                    **anchor_entry,
+                    "l2": anchor_entry.get("l2"),
+                    "source": anchor_entry.get("source", "score_topk"),
+                }
+                for anchor_entry in anchor_entries[:3]
+                if isinstance(anchor_entry, dict)
+            ]
+
+        anchor_path = str(record.get("anchor_path") or "")
+        state_format = str(record.get("anchor_state_format") or "delta")
+        cache_key = (anchor_path, state_format)
+        if cache_key not in anchor_template_cache:
+            anchor_template_cache[cache_key] = _load_anchor_xy_templates(anchor_path, state_format)
+
+        anchor_templates = anchor_template_cache[cache_key]
+        if anchor_templates is not None and record.get("anchor_score_topk"):
+            entries = []
+            for rank, item in enumerate(record.get("anchor_score_topk", [])[:3], start=1):
+                if not isinstance(item, dict):
+                    continue
+                anchor_index = item.get("index")
+                if anchor_index is None:
+                    continue
+                anchor_index = int(anchor_index)
+                if anchor_index < 0 or anchor_index >= anchor_templates.shape[0]:
+                    continue
+                entries.append(
+                    {
+                        "rank": rank,
+                        "index": anchor_index,
+                        "score": item.get("score"),
+                        "l2": None,
+                        "xy": anchor_templates[anchor_index].tolist(),
+                        "source": "score_topk",
+                    }
+                )
+            if entries:
+                return entries
+
+        return [
+            {
+                "rank": 1,
+                "index": record.get("selected_anchor_index"),
+                "score": record.get("anchor_score_selected"),
+                "l2": None,
+                "xy": record.get("selected_anchor_template_xy"),
+                "source": "score_topk",
+            }
+        ]
+
+    @staticmethod
+    def _load_selected_anchor_sources(
+        simulation_file: pathlib.Path, simulation_history: Any, scenario: Any
+    ) -> Dict[int, ColumnDataSource]:
+        """
+        Load selected anchor trajectories from anchor selection JSONL logs.
+        :param simulation_file: Serialized SimulationLog path.
+        :param simulation_history: Simulation history used to align ego_time_us to frame index.
+        :param scenario: Simulation scenario used to compute GT-nearest anchors.
+        :return: Selected anchor data sources keyed by frame index.
+        """
+        history_samples = list(simulation_history.data)
+        time_to_frame = {sample.ego_state.time_us: index for index, sample in enumerate(history_samples)}
+        scenario_start_time_us = history_samples[0].ego_state.time_us if history_samples else None
+        scenario_id_time_marker = f"_{scenario_start_time_us}_" if scenario_start_time_us is not None else ""
+        frame_sources: Dict[int, ColumnDataSource] = {}
+        expert_states = list(scenario.get_expert_ego_trajectory()) if scenario is not None else []
+        expert_time_to_index = {state.time_us: index for index, state in enumerate(expert_states)}
+        anchor_template_cache: Dict[Tuple[str, str], Optional[np.ndarray]] = {}
+        anchor_log_dirs = SimulationTile._find_anchor_log_dirs(simulation_file)
+        if not anchor_log_dirs:
+            logger.warning("No selected anchor log dirs found for simulation file: %s", simulation_file)
+            return frame_sources
+
+        loaded_records = 0
+        matched_records = 0
+        for anchor_log_dir in anchor_log_dirs:
+            for anchor_log_file in sorted(anchor_log_dir.glob("*.jsonl")):
+                try:
+                    with open(anchor_log_file, "r") as file:
+                        for line in file:
+                            if not line.strip():
+                                continue
+                            record = json.loads(line)
+                            loaded_records += 1
+
+                            record_scenario_id = str(record.get("scenario_id") or "")
+                            scenario_id_matches_current = bool(
+                                scenario_id_time_marker and scenario_id_time_marker in record_scenario_id
+                            )
+                            if record_scenario_id and not scenario_id_matches_current:
+                                continue
+
+                            frame_index = time_to_frame.get(record.get("ego_time_us"))
+                            if frame_index is None:
+                                iteration_index = record.get("iteration_index")
+                                if (
+                                    scenario_id_matches_current
+                                    and isinstance(iteration_index, int)
+                                    and 0 <= iteration_index < len(history_samples)
+                                ):
+                                    frame_index = iteration_index
+                            ego = record.get("ego")
+                            if frame_index is None or not ego:
+                                continue
+
+                            anchor_entries = SimulationTile._score_topk_anchor_entries(
+                                record=record,
+                                anchor_template_cache=anchor_template_cache,
+                            )
+                            anchor_entries += SimulationTile._gt_l2_anchor_entries(
+                                record=record,
+                                frame_index=frame_index,
+                                history_samples=history_samples,
+                                expert_states=expert_states,
+                                expert_time_to_index=expert_time_to_index,
+                                anchor_template_cache=anchor_template_cache,
+                            )
+
+                            xs_list = []
+                            ys_list = []
+                            anchor_sources = []
+                            anchor_ranks = []
+                            selected_anchor_indices = []
+                            anchor_scores = []
+                            anchor_l2s = []
+                            line_colors = []
+                            line_widths = []
+                            for anchor_entry in anchor_entries:
+                                local_xy = anchor_entry.get("xy")
+                                if local_xy is None or len(local_xy) == 0:
+                                    continue
+                                local_xy = [[0.0, 0.0], *local_xy]
+
+                                source = anchor_entry.get("source", "score_topk")
+                                style_key = (
+                                    "gt_l2_anchor_topk"
+                                    if source == "gt_l2_topk"
+                                    else "selected_anchor_topk"
+                                )
+                                topk_style = simulation_tile_trajectory_style[style_key]
+                                rank = int(anchor_entry.get("rank", 1))
+                                xs, ys = _transform_local_xy_to_global(local_xy, ego)
+                                xs_list.append(xs)
+                                ys_list.append(ys)
+                                anchor_sources.append(source)
+                                anchor_ranks.append(anchor_entry.get("rank", rank))
+                                selected_anchor_indices.append(anchor_entry.get("index"))
+                                anchor_scores.append(anchor_entry.get("score"))
+                                anchor_l2s.append(anchor_entry.get("l2"))
+                                line_colors.append(
+                                    topk_style["line_colors"][
+                                        min(rank - 1, len(topk_style["line_colors"]) - 1)
+                                    ]
+                                )
+                                line_widths.append(
+                                    topk_style["line_widths"][
+                                        min(rank - 1, len(topk_style["line_widths"]) - 1)
+                                    ]
+                                )
+                            if not xs_list:
+                                continue
+
+                            matched_records += 1
+                            frame_sources[frame_index] = ColumnDataSource(
+                                dict(
+                                    xs=xs_list,
+                                    ys=ys_list,
+                                    selected_anchor_index=selected_anchor_indices,
+                                    anchor_source=anchor_sources,
+                                    anchor_rank=anchor_ranks,
+                                    anchor_score=anchor_scores,
+                                    anchor_l2=anchor_l2s,
+                                    line_colors=line_colors,
+                                    line_widths=line_widths,
+                                )
+                            )
+                except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    logger.info("Unable to load selected anchor log %s: %s", anchor_log_file, exc)
+
+        if loaded_records and not matched_records:
+            logger.warning(
+                "Loaded %d selected anchor records but matched 0 frames for simulation file: %s",
+                loaded_records,
+                simulation_file,
+            )
+
+        return frame_sources
 
     def init_simulations(self, figure_sizes: List[int]) -> None:
         """
@@ -856,6 +1260,21 @@ class SimulationTile:
 
         # Update ego pose trajectory state plot.
         main_figure.ego_state_trajectory_plot.update_plot(
+            main_figure=main_figure.figure,
+            frame_index=frame_index,
+            doc=self._doc,
+        )
+
+        if main_figure.future_expert_trajectory_plot:
+            # Update future expert trajectory plot.
+            main_figure.future_expert_trajectory_plot.update_plot(
+                main_figure=main_figure.figure,
+                frame_index=frame_index,
+                doc=self._doc,
+            )
+
+        # Update selected anchor trajectory plot.
+        main_figure.selected_anchor_trajectory_plot.update_plot(
             main_figure=main_figure.figure,
             frame_index=frame_index,
             doc=self._doc,

@@ -394,6 +394,175 @@ class EgoStateTrajectoryPlot(BaseScenarioPlot):
                 self.data_sources[frame_index] = source
                 self.data_source_condition.notify()
 
+@dataclass
+class FutureExpertTrajectoryPlot(BaseScenarioPlot):
+    """A dataclass for per-frame future expert (GT) trajectory plot.
+
+    Unlike the static full expert trajectory, this plot shows only the future
+    portion of the GT starting from the current simulation frame, and updates
+    every frame so users can see how the remaining GT evolves.
+    """
+
+    data_sources: Dict[int, ColumnDataSource] = field(default_factory=dict)
+    plot: Optional[GlyphRenderer] = None
+
+    def update_plot(self, main_figure: Figure, frame_index: int, doc: Document) -> None:
+        """
+        Update the plot.
+        :param main_figure: The plotting figure.
+        :param frame_index: Frame index.
+        :param doc: Bokeh document that the plot lives in.
+        """
+        if not self.data_source_condition:
+            return
+
+        self.render_event.set()  # type: ignore
+
+        with self.data_source_condition:
+            while self.data_sources.get(frame_index, None) is None:
+                self.data_source_condition.wait()
+
+            data_sources = dict(self.data_sources[frame_index].data)
+
+            def update_main_figure() -> None:
+                """Wrapper for the main_figure update logic to support multi-threading."""
+                style = simulation_tile_trajectory_style["future_expert_ego"]
+                if self.plot is None:
+                    self.plot = main_figure.line(
+                        x="xs",
+                        y="ys",
+                        line_color=style["line_color"],
+                        line_width=style["line_width"],
+                        line_alpha=style["line_alpha"],
+                        line_dash=style.get("line_dash", "solid"),
+                        source=data_sources,
+                    )
+                else:
+                    self.plot.data_source.data = data_sources
+
+                self.render_event.clear()  # type: ignore
+
+            doc.add_next_tick_callback(lambda: update_main_figure())
+
+    def update_data_sources(
+        self, scenario: AbstractScenario, history: SimulationHistory, future_time_horizon: float = 8.0
+    ) -> None:
+        """
+        Update future expert trajectory data sources for each frame.
+        :param scenario: The simulation scenario (used to query GT future trajectory).
+        :param history: SimulationHistory time-series data.
+        :param future_time_horizon: [s] How far into the future to query the GT.
+        """
+        if not self.data_source_condition:
+            return
+
+        with self.data_source_condition:
+            for frame_index, sample in enumerate(history.data):
+                iteration_index = sample.iteration.index
+                x_coords = []
+                y_coords = []
+                try:
+                    future_states = list(
+                        scenario.get_ego_future_trajectory(
+                            iteration=iteration_index, time_horizon=future_time_horizon
+                        )
+                    )
+                    for state in future_states:
+                        x_coords.append(state.center.x)
+                        y_coords.append(state.center.y)
+                except Exception:
+                    pass  # Near the end of scenario, future data may be unavailable
+
+                source = ColumnDataSource(dict(xs=x_coords, ys=y_coords))
+                self.data_sources[frame_index] = source
+                self.data_source_condition.notify()
+
+
+@dataclass
+class SelectedAnchorTrajectoryPlot(BaseScenarioPlot):
+    """A dataclass for selected anchor trajectory plot."""
+
+    data_sources: Dict[int, ColumnDataSource] = field(default_factory=dict)  # A dict of data sources for each frame
+    plot: Optional[GlyphRenderer] = None  # A bokeh glyph element
+
+    def update_plot(self, main_figure: Figure, frame_index: int, doc: Document) -> None:
+        """
+        Update the selected anchor trajectory plot.
+        :param main_figure: The plotting figure.
+        :param frame_index: Frame index.
+        :param doc: Bokeh document that the plot lives in.
+        """
+        if not self.data_source_condition:
+            return
+
+        self.render_event.set()  # type: ignore
+
+        with self.data_source_condition:
+            while self.data_sources.get(frame_index, None) is None:
+                self.data_source_condition.wait()
+
+            data_sources = dict(self.data_sources[frame_index].data)
+
+            def update_main_figure() -> None:
+                """Wrapper for the main_figure update logic to support multi-threading."""
+                if self.plot is None:
+                    style = simulation_tile_trajectory_style["selected_anchor_topk"]
+                    self.plot = main_figure.multi_line(
+                        xs="xs",
+                        ys="ys",
+                        line_color="line_colors",
+                        line_width="line_widths",
+                        line_alpha=style["line_alpha"],
+                        line_dash=style["line_dash"],
+                        source=data_sources,
+                    )
+                    selected_anchor_hover = HoverTool(
+                        renderers=[self.plot],
+                        tooltips=[
+                            ("source", "@anchor_source"),
+                            ("rank", "@anchor_rank"),
+                            ("anchor_index", "@selected_anchor_index"),
+                            ("score", "@anchor_score{0.000}"),
+                            ("gt_l2", "@anchor_l2{0.000}"),
+                        ],
+                    )
+                    main_figure.add_tools(selected_anchor_hover)
+                else:
+                    self.plot.data_source.data = data_sources
+
+                self.render_event.clear()  # type: ignore
+
+            doc.add_next_tick_callback(lambda: update_main_figure())
+
+    def update_data_sources(self, frame_sources: Dict[int, ColumnDataSource], history: SimulationHistory) -> None:
+        """
+        Update selected anchor trajectory data sources.
+        :param frame_sources: Data sources keyed by frame index.
+        :param history: SimulationHistory time-series data.
+        """
+        if not self.data_source_condition:
+            return
+
+        with self.data_source_condition:
+            for frame_index in range(len(history.data)):
+                self.data_sources[frame_index] = frame_sources.get(
+                    frame_index,
+                    ColumnDataSource(
+                        dict(
+                            xs=[],
+                            ys=[],
+                            selected_anchor_index=[],
+                            anchor_source=[],
+                            anchor_rank=[],
+                            anchor_score=[],
+                            anchor_l2=[],
+                            line_colors=[],
+                            line_widths=[],
+                        )
+                    ),
+                )
+                self.data_source_condition.notify()
+
 
 @dataclass
 class AgentStatePlot(BaseScenarioPlot):
@@ -667,6 +836,8 @@ class SimulationFigure:
     traffic_light_plot: Optional[TrafficLightPlot] = None  # Traffic light plot
     ego_state_plot: Optional[EgoStatePlot] = None  # Ego state plot
     ego_state_trajectory_plot: Optional[EgoStateTrajectoryPlot] = None  # Ego state trajectory plot
+    selected_anchor_trajectory_plot: Optional[SelectedAnchorTrajectoryPlot] = None  # Selected anchor trajectory plot
+    future_expert_trajectory_plot: Optional[FutureExpertTrajectoryPlot] = None  # Future expert trajectory plot
     agent_state_plot: Optional[AgentStatePlot] = None  # Agent state plot
     agent_state_heading_plot: Optional[AgentStateHeadingPlot] = None  # Agent state heading plot
 
@@ -693,6 +864,12 @@ class SimulationFigure:
         if self.ego_state_trajectory_plot is None:
             self.ego_state_trajectory_plot = EgoStateTrajectoryPlot()
 
+        if self.selected_anchor_trajectory_plot is None:
+            self.selected_anchor_trajectory_plot = SelectedAnchorTrajectoryPlot()
+
+        if self.future_expert_trajectory_plot is None:
+            self.future_expert_trajectory_plot = FutureExpertTrajectoryPlot()
+
         if self.agent_state_plot is None:
             self.agent_state_plot = AgentStatePlot()
 
@@ -705,6 +882,8 @@ class SimulationFigure:
             self.traffic_light_plot,
             self.ego_state_plot,
             self.ego_state_trajectory_plot,
+            self.selected_anchor_trajectory_plot,
+            self.future_expert_trajectory_plot,
             self.agent_state_plot,
             self.agent_state_heading_plot,
         ]
@@ -732,6 +911,8 @@ class SimulationFigure:
         self.traffic_light_plot.data_sources = other.traffic_light_plot.data_sources  # type: ignore
         self.ego_state_plot.data_sources = other.ego_state_plot.data_sources  # type: ignore
         self.ego_state_trajectory_plot.data_sources = other.ego_state_trajectory_plot.data_sources  # type: ignore
+        self.selected_anchor_trajectory_plot.data_sources = other.selected_anchor_trajectory_plot.data_sources  # type: ignore
+        self.future_expert_trajectory_plot.data_sources = other.future_expert_trajectory_plot.data_sources  # type: ignore
         self.agent_state_plot.data_sources = other.agent_state_plot.data_sources  # type: ignore
         self.agent_state_heading_plot.data_sources = other.agent_state_heading_plot.data_sources  # type: ignore
 
@@ -759,6 +940,14 @@ class SimulationFigure:
             if plot:
                 t = threading.Thread(target=plot.update_data_sources, args=(self.simulation_history,), daemon=True)
                 t.start()
+
+        if self.future_expert_trajectory_plot:
+            t = threading.Thread(
+                target=self.future_expert_trajectory_plot.update_data_sources,
+                args=(self.scenario, self.simulation_history),
+                daemon=True,
+            )
+            t.start()
 
     def update_map_dependent_data_sources(self) -> None:
         """
@@ -865,9 +1054,18 @@ class SimulationFigure:
         :return A list of glyphs to be updated.
         """
         if glyph_name == 'Expert Trajectory':
-            return [self.expert_trajectory_plot if self.expert_trajectory_plot is not None else None]
+            return [
+                self.expert_trajectory_plot if self.expert_trajectory_plot is not None else None,
+                self.future_expert_trajectory_plot.plot if self.future_expert_trajectory_plot is not None else None,
+            ]
         elif glyph_name == 'Ego Trajectory':
             return [self.ego_state_trajectory_plot.plot if self.ego_state_trajectory_plot is not None else None]
+        elif glyph_name == 'Selected Anchor':
+            return [
+                self.selected_anchor_trajectory_plot.plot
+                if self.selected_anchor_trajectory_plot is not None
+                else None
+            ]
         elif glyph_name == 'Goal':
             return [self.mission_goal_plot]
         elif glyph_name == 'Traffic Light':
@@ -900,7 +1098,7 @@ class SimulationFigure:
         for glyph_name in glyph_names:
             if glyph_name == 'Ego':
                 glyphs += [self.ego_state_plot.plot if self.ego_state_plot is not None else None]
-            elif glyph_name in ['Expert Trajectory', 'Ego Trajectory', 'Goal', 'Traffic Light']:
+            elif glyph_name in ['Expert Trajectory', 'Ego Trajectory', 'Selected Anchor', 'Goal', 'Traffic Light']:
                 glyphs += self._get_trajectory_glyph_to_update(glyph_name=glyph_name)
             elif glyph_name in ['Vehicle', 'Pedestrian', 'Bicycle', 'Generic', 'Traffic Cone', 'Barrier', 'Czone Sign']:
                 glyphs += self._get_agent_glyph_to_update(glyph_name=glyph_name)
@@ -951,11 +1149,15 @@ class SimulationFigure:
             ("Ego", [self.ego_state_plot.plot]),
             ("Ego traj", [self.ego_state_trajectory_plot.plot]),
         ]
+        if self.selected_anchor_trajectory_plot is not None and self.selected_anchor_trajectory_plot.plot is not None:
+            legend_items.append(("Selected anchor", [self.selected_anchor_trajectory_plot.plot]))
         if self.mission_goal_plot is not None:
             legend_items.append(("Goal", [self.mission_goal_plot]))
 
         if self.expert_trajectory_plot is not None:
             legend_items.append(("Expert traj", [self.expert_trajectory_plot]))
+        if self.future_expert_trajectory_plot is not None and self.future_expert_trajectory_plot.plot is not None:
+            legend_items.append(("Future GT traj", [self.future_expert_trajectory_plot.plot]))
 
         legend_items += agent_legends
         legend_items += map_polygon_legend_items
